@@ -1,0 +1,17 @@
+{
+  "theme": {
+    "background_gradient": "linear-gradient(135deg, #2E3136 0%, #1F2124 100%)",
+    "sidebar_bg": "#18191C",
+    "sidebar_border": "#2B2D31",
+    "text_main": "#E0E0E0",
+    "text_muted": "#949BA4",
+    "input_bg": "#111214",
+    "input_border": "#2B2D31",
+    "accent_color": "#5865F2",
+    "edge_color": "#00BFFF",
+    "node_bg_default": "#2B2D31",
+    "code_bg": "#111214",
+    "scrollbar_thumb": "#404249",
+    "scrollbar_track": "#18191C"
+  }
+}
