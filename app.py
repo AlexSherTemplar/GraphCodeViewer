@@ -74,6 +74,8 @@ class PythonAnalyzer(ast.NodeVisitor):
         try:
             with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
                 self.file_content = f.read()
+                # Сохраняем код файла для отображения
+                self.elements[file_id]['code'] = self.file_content
                 self.source_lines = self.file_content.splitlines()
                 tree = ast.parse(self.file_content)
                 self.visit(tree)
@@ -158,6 +160,7 @@ class CppAnalyzer:
         self.current_file = None
         self.original_content = ""
         self.masked_content = ""
+        self.found_vars = set()
 
     def remove_comments(self, text):
         def replacer(match): return re.sub(r'[^\n]', ' ', match.group(0))
@@ -166,15 +169,29 @@ class CppAnalyzer:
     def parse_file(self, file_path):
         self.current_file = file_path
         file_id = os.path.basename(file_path)
-        self.elements[file_id] = {'id': file_id, 'name': file_id, 'type': 'file', 'lang': 'cpp', 'code': ''}
         try:
             with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
                 self.original_content = f.read()
+                # Сохраняем весь контент файла
+                self.elements[file_id] = {'id': file_id, 'name': file_id, 'type': 'file', 'lang': 'cpp', 'code': self.original_content}
+
                 self.masked_content = self.remove_comments(self.original_content)
+                self.found_vars = set()
                 self.parse_block(self.masked_content, file_id)
         except: pass
 
     def parse_block(self, content, parent_id):
+        var_pattern = re.compile(r'^\s*(?:(?:extern|static|const|constexpr)\s+)*([\w:<>*&]+)\s+(\w+)\s*(?:=.*|\(.*?\))?;', re.MULTILINE)
+        for match in var_pattern.finditer(content):
+            v_name = match.group(2)
+            if v_name not in self.keywords:
+                self.found_vars.add(v_name)
+                var_id = f"{parent_id}::{v_name}"
+                ls = self.original_content.rfind('\n', 0, match.start()) + 1
+                le = self.original_content.find('\n', match.end())
+                code = self.original_content[ls:le].strip()
+                self.elements[var_id] = {'id': var_id, 'name': v_name, 'type': 'variable', 'lang': 'cpp', 'parent': parent_id, 'code': code, 'complexity': 0, 'loc': 1}
+
         class_pattern = re.compile(r'\b(class|struct)\s+(\w+)\s*(?::[^\{]+)?\s*\{')
         for match in class_pattern.finditer(content):
             c_name = match.group(2)
@@ -196,7 +213,7 @@ class CppAnalyzer:
             body, end = self.extract_body(content, match.end() - 1)
             f_id = f"{parent_id}::{f_name}"
             f_type = 'entry_point' if clean_name == 'main' else ('dunder' if clean_name.startswith('~') else 'function')
-            full_code = self.get_original(match.start(), end, relative_to_content=content)
+            full_code = self.get_original(match.start(), end, relative_to_content=content).lstrip(';}\n\r')
 
             self.elements[f_id] = {
                 'id': f_id, 'name': f_name, 'type': f_type, 'lang': 'cpp',
@@ -213,6 +230,16 @@ class CppAnalyzer:
                 snip = f"{callee}(...)"
                 self.calls.append((caller_id, callee, snip))
 
+        call_p2 = re.compile(r'(?:[\w>\]\)]+)(\.|->)(\w+)\s*\(')
+        for cm in call_p2.finditer(body):
+            if cm.group(2) not in self.keywords:
+                snip = f"...{cm.group(1)}{cm.group(2)}(...)"
+                self.calls.append((caller_id, cm.group(2), snip))
+
+        for v in self.found_vars:
+            if re.search(r'\b' + re.escape(v) + r'\b', body):
+                self.var_usages.append((caller_id, v))
+
     def extract_body(self, text, start):
         balance = 0; idx = start; length = len(text)
         while idx < length:
@@ -223,7 +250,8 @@ class CppAnalyzer:
         return "", idx
 
     def get_original(self, start, end, relative_to_content=None):
-        return relative_to_content[start:end] if relative_to_content else ""
+        if relative_to_content: return relative_to_content[start:end]
+        return self.original_content[start:end]
 
 class ProjectManager:
     def analyze(self, path, allowed_langs):
@@ -235,21 +263,17 @@ class ProjectManager:
             if 'python' in allowed_langs:
                 for f in glob.glob(os.path.join(path, "**/*.py"), recursive=True): py.parse_file(f)
             if 'cpp' in allowed_langs:
-                for ext in ['*.cpp', '*.c', '*.h']:
+                for ext in ['*.cpp', '*.c', '*.h', '*.hpp']:
                     for f in glob.glob(os.path.join(path, "**/" + ext), recursive=True): cpp.parse_file(f)
 
         all_elems = {**py.elements, **cpp.elements}
         all_calls = py.calls + cpp.calls
+        all_vars = py.var_usages + cpp.var_usages
         elements = []
 
         for eid, data in all_elems.items():
-            # Генерируем классы
             classes = f"{data['type'].replace('_', '-')} {data['lang']}-node"
             if data.get('complexity', 0) > 10: classes += " complex-code"
-
-            # Определяем, является ли нода контейнером (файлом или классом)
-            if data['type'] in ['file', 'class']:
-                classes += " container-node"
 
             search_txt = f"{data['name']} {data.get('code','')}".lower()
 
@@ -283,6 +307,16 @@ class ProjectManager:
                             is_cross = root_src != root_tgt
                             elements.append({'data': {'source': src, 'target': tid, 'snippet': snip}, 'classes': 'cross-file' if is_cross else 'internal'})
                             added_edges.add(edge_id)
+
+        for fid, vname in all_vars:
+            for tid, data in all_elems.items():
+                if data['type'] == 'variable' and data['name'] == vname:
+                    if all_elems[fid]['lang'] == data['lang']:
+                        if os.path.basename(all_elems[fid]['id'].split('::')[0]) == os.path.basename(data['id'].split('::')[0]):
+                            edge_id = f"{fid}->{tid}"
+                            if eid not in added_edges:
+                                elements.append({'data': {'source': fid, 'target': tid}, 'classes': 'var-usage'})
+                                added_edges.add(eid)
         return elements
 
 # ==========================================
@@ -292,16 +326,26 @@ class ProjectManager:
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG], suppress_callback_exceptions=True)
 manager = ProjectManager()
 
+# JS: Добавлено предотвращение контекстного меню для ПКМ панорамирования
 JS_SCRIPTS = """
 <script>
+    // Отключаем контекстное меню в графе, чтобы ПКМ работала как Pan
+    document.addEventListener("contextmenu", function(e) {
+        if (e.target.closest("#code-graph")) {
+            e.preventDefault();
+        }
+    });
+
     window.dash_clientside = Object.assign({}, window.dash_clientside, {
         clientside: {
             toggleSidebar: function(n_clicks, selectedData, edgeData, width_data, is_open) {
                 var ctx = dash_clientside.callback_context;
                 var trigger = ctx.triggered.length > 0 ? ctx.triggered[0].prop_id : "";
                 var new_state = is_open;
+                
                 if (trigger.includes("btn-toggle")) new_state = !is_open;
                 else if (trigger.includes("code-graph") && (selectedData || edgeData)) new_state = true;
+
                 var sb = document.getElementById("sidebar");
                 var mc = document.getElementById("main-content");
                 if (sb && mc) {
@@ -351,33 +395,31 @@ app.index_string = f'''
             .sidebar-container {{ position: fixed; top: 0; left: 0; bottom: 0; background: {CFG['sidebar_bg']}; border-right: 1px solid {CFG['sidebar_border']}; z-index: 1000; display: flex; flex-direction: column; transition: transform 0.3s ease; overflow: visible !important; }}
             .sidebar-content {{ padding: 0; overflow: hidden; height: 100%; display: flex; flex-direction: column; }}
             .tab-content {{ padding: 15px; overflow-y: auto; height: 100%; }}
-            
-            .sidebar-toggle-btn {{
-                position: absolute; top: 50%; right: -24px; width: 24px; height: 48px; transform: translateY(-50%); z-index: 2005;
-                border: 1px solid {CFG['sidebar_border']}; border-left: none; border-radius: 0 12px 12px 0;
-                background-color: {CFG['sidebar_bg']}; color: {CFG['accent_color']};
-                display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; font-size: 18px; line-height: 1;
-                box-shadow: 3px 0 6px rgba(0,0,0,0.2); transition: background-color 0.2s, color 0.2s;
-            }}
+            .sidebar-toggle-btn {{ position: absolute; top: 50%; right: -24px; width: 24px; height: 48px; transform: translateY(-50%); z-index: 2005; background: {CFG['sidebar_bg']}; border: 1px solid {CFG['sidebar_border']}; border-left: none; border-radius: 0 12px 12px 0; color: {CFG['accent_color']}; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; font-size: 18px; line-height: 1; box-shadow: 3px 0 6px rgba(0,0,0,0.2); transition: background-color 0.2s, color 0.2s; }}
             .sidebar-toggle-btn:hover {{ background-color: {CFG['node_bg_default']}; color: #fff; }}
-
             .custom-tabs {{ border-bottom: 1px solid {CFG['sidebar_border']}; }}
             .custom-tab {{ border: none !important; background-color: {CFG['sidebar_bg']} !important; color: {CFG['text_muted']} !important; padding: 10px !important; cursor: pointer; }}
             .custom-tab--selected {{ background-color: {CFG['input_bg']} !important; color: {CFG['accent_color']} !important; border-bottom: 2px solid {CFG['accent_color']} !important; }}
-            
             .modern-input {{ background-color: {CFG['input_bg']} !important; border: 1px solid {CFG['input_border']} !important; color: {CFG['text_main']} !important; }}
             .modern-input:focus {{ border-color: {CFG['accent_color']} !important; }}
-            
             .resizer {{ width: 5px; cursor: col-resize; position: absolute; top: 0; right: 0; bottom: 0; z-index: 1001; }}
             .resizer:hover {{ background: {CFG['accent_color']}; }}
-            
             .main-content {{ position: absolute; top: 0; bottom: 0; right: 0; transition: left 0.1s; background: transparent; }}
-            
-            pre, code, .hljs {{ background: {CFG['code_bg']} !important; color: #dcdcdc !important; }}
+            pre, code, .hljs {{ background: {CFG['code_bg']} !important; color: #dcdcdc !important; border: none !important; }}
             .hljs-string {{ color: #FF9D00 !important; }} 
             .hljs-keyword {{ color: #C678DD !important; }}
             .list-group-item {{ background: {CFG['input_bg']}; border-color: {CFG['input_border']}; color: {CFG['text_main']}; }}
             .list-group-item:hover {{ background: {CFG['node_bg_default']}; color: white; }}
+            
+            /* СТИЛИ ЛЕГЕНДЫ */
+            .legend-item {{ display: flex; align-items: center; margin-bottom: 8px; font-size: 0.85rem; color: #ccc; }}
+            .legend-icon {{ width: 14px; height: 14px; margin-right: 10px; border: 1px solid #555; }}
+            .l-py {{ background: #3498DB; border-radius: 50%; }}
+            .l-cpp {{ background: #E67E22; border-radius: 50%; }}
+            .l-cls {{ background: #444; border-radius: 2px; border: 1px dashed #CF3721 !important; }}
+            .l-file {{ background: {CFG['node_bg_default']}; border-radius: 2px; border: 1px dashed #777 !important; opacity: 0.5; }}
+            .l-var {{ background: #1ABC9C; border-radius: 2px; }}
+            .l-entry {{ background: #2ECC71; border-radius: 50%; border: 2px solid #fff; }}
         </style>
     </head>
     <body>
@@ -388,12 +430,11 @@ app.index_string = f'''
 '''
 
 graph_styles = [
-    # === КОНТЕЙНЕРЫ (ФАЙЛЫ, КЛАССЫ) - ВСЕГДА ПРОЗРАЧНЫЕ ===
-    # Используем :parent чтобы выбрать все группирующие элементы
+    # Контейнеры
     {
         'selector': ':parent',
         'style': {
-            'background-opacity': 0.05, # Почти прозрачный фон
+            'background-opacity': 0.05,
             'background-color': CFG['node_bg_default'],
             'border-width': 1,
             'border-color': '#777',
@@ -405,41 +446,22 @@ graph_styles = [
             'shape': 'roundrectangle'
         }
     },
-
-    # === ОБЫЧНЫЕ НОДЫ (ФУНКЦИИ, ПЕРЕМЕННЫЕ) ===
-    # node:child выбирает ноды, которые находятся внутри чего-то (или просто не parent)
-    # Если у ноды нет детей, она не parent
-    {
-        'selector': 'node:childless',
-        'style': {
-            'content': 'data(label)',
-            'color': '#ddd',
-            'font-size': 11,
-            'text-valign': 'center',
-            'text-halign': 'center',
-            'width': 45,
-            'height': 45,
-            'border-width': 0
-        }
-    },
-
+    # Обычные ноды
+    {'selector': 'node:childless', 'style': {'content': 'data(label)', 'color': '#ddd', 'font-size': 11, 'text-valign': 'center', 'text-halign': 'center', 'width': 45, 'height': 45}},
     {'selector': '.python-node', 'style': {'background-color': '#3498DB'}},
     {'selector': '.cpp-node', 'style': {'background-color': '#E67E22'}},
     {'selector': '.entry-point', 'style': {'background-color': '#2ECC71', 'width': 60, 'height': 60, 'border-width': 3, 'border-color': '#fff'}},
     {'selector': '.dunder', 'style': {'background-color': '#9B59B6', 'width': 35, 'height': 35}},
     {'selector': '.variable', 'style': {'background-color': '#1ABC9C', 'shape': 'rectangle', 'width': 40, 'height': 20}},
     {'selector': '.complex-code', 'style': {'border-width': 3, 'border-color': '#E74C3C'}},
-
-    # === СВЯЗИ ===
+    # Связи
     {'selector': 'edge', 'style': {'width': 2, 'line-color': CFG.get('edge_color', '#00BFFF'), 'target-arrow-color': CFG.get('edge_color', '#00BFFF'), 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'opacity': 0.7}},
     {'selector': '.cross-file', 'style': {'line-style': 'dashed', 'width': 3, 'opacity': 0.9}},
-    {'selector': '.path-highlight', 'style': {'line-color': '#FFD700', 'target-arrow-color': '#FFD700', 'width': 5, 'z-index': 9999, 'opacity': 1}},
-
-    # === ВЫДЕЛЕНИЕ ПРИ КЛИКЕ ===
-    {'selector': ':selected', 'style': {'border-width': 4, 'border-color': '#FFF', 'background-color': '#E74C3C'}},
+    {'selector': '.var-usage', 'style': {'line-style': 'dotted', 'line-color': '#7F8C8D', 'target-arrow-color': '#7F8C8D', 'width': 1}},
+    {'selector': 'edge:selected', 'style': {'width': 4, 'line-color': '#E74C3C', 'target-arrow-color': '#E74C3C'}},
 ]
 
-# --- LAYOUT ---
+# --- TABS ---
 
 tab_explorer = html.Div(className='tab-content', children=[
     dbc.Row([
@@ -449,7 +471,7 @@ tab_explorer = html.Div(className='tab-content', children=[
     ], className="mb-3 g-1"),
 
     dbc.InputGroup([
-        dbc.Input(id="input-dir", placeholder="File/Folder Path...", className="modern-input"),
+        dbc.Input(id="input-dir", placeholder="Path...", className="modern-input"),
         dbc.Button("Load", id="btn-load", color="primary"),
     ], className="mb-3"),
 
@@ -467,35 +489,52 @@ tab_explorer = html.Div(className='tab-content', children=[
 ])
 
 tab_settings = html.Div(className='tab-content', children=[
-    html.Label("Filter Types:", className="text-muted"),
+    html.Label("Filter:", className="text-muted"),
     dbc.Checklist(
-        options=[
-            {"label": "Functions", "value": "function"},
-            {"label": "Variables", "value": "variable"},
-            {"label": "Classes", "value": "class"},
-            {"label": "Dunder Methods", "value": "dunder"},
-        ],
-        value=["function", "variable", "class", "dunder"],
-        id="filter-types", switch=True, className="mb-3 text-white"
+        options=[{"label": "Functions", "value": "function"}, {"label": "Variables", "value": "variable"}, {"label": "Classes", "value": "class"}, {"label": "Dunder", "value": "dunder"}],
+        value=["function", "variable", "class", "dunder"], id="filter-types", switch=True, className="mb-3 text-white"
     ),
     html.Hr(style={'borderColor': '#444'}),
 
     html.Label("Content Spread", className="text-muted mt-2"),
-    dcc.Slider(id='setting-repulsion', min=100000, max=5000000, step=500000, value=2000000, marks={500000: 'Tight', 2000000: 'Medium', 5000000: 'Loose'}, tooltip={"placement": "bottom", "always_visible": False}),
-
+    dcc.Slider(id='setting-repulsion', min=1, max=5, step=1, value=3, marks={1:'Tight', 3:'Normal', 5:'Loose'}, tooltip={"placement": "bottom"}),
     html.Label("Edge Length", className="text-muted mt-4"),
-    dcc.Slider(id='setting-edge-len', min=20, max=200, step=10, value=50, marks={20: 'Short', 100: 'Normal', 200: 'Long'}, tooltip={"placement": "bottom", "always_visible": False}),
-
+    dcc.Slider(id='setting-edge-len', min=1, max=5, step=1, value=3, marks={1:'Short', 3:'Normal', 5:'Long'}, tooltip={"placement": "bottom"}),
     html.Label("Box Padding", className="text-muted mt-4"),
-    dcc.Slider(id='setting-padding', min=5, max=100, step=10, value=20, marks={5: 'Minimal', 50: 'Spacious'}, tooltip={"placement": "bottom", "always_visible": False}),
-
+    dcc.Slider(id='setting-padding', min=1, max=5, step=1, value=2, marks={1:'Min', 5:'Max'}, tooltip={"placement": "bottom"}),
     html.Label("Box Spacing", className="text-muted mt-4"),
-    dcc.Slider(id='setting-spacing', min=20, max=300, step=50, value=100, marks={20: 'Close', 150: 'Far', 300: 'Very Far'}, tooltip={"placement": "bottom", "always_visible": False}),
-
+    dcc.Slider(id='setting-spacing', min=1, max=5, step=1, value=2, marks={1:'Close', 5:'Far'}, tooltip={"placement": "bottom"}),
     html.Hr(style={'borderColor': '#444'}),
     html.Label("Dimmed Opacity", className="text-muted mt-4"),
-    dcc.Slider(id='setting-node-opacity', min=0, max=0.5, step=0.05, value=0.1, marks={0: 'Hidden', 0.1: 'Faint', 0.5: 'Visible'}, tooltip={"placement": "bottom", "always_visible": False}),
+    dcc.Slider(id='setting-node-opacity', min=1, max=5, step=1, value=1, marks={1:'Faint', 5:'Visible'}, tooltip={"placement": "bottom"}),
     dcc.Slider(id='setting-edge-opacity', min=0, max=0.5, step=0.05, value=0.05, className="d-none"),
+])
+
+# --- НОВАЯ ВКЛАДКА HELP (ЛЕГЕНДА) ---
+tab_help = html.Div(className='tab-content', children=[
+    html.H4("Legend & Help", className="text-white mb-3"),
+
+    html.Div([
+        html.Div([html.Div(className="legend-icon l-py"), "Python Function"], className="legend-item"),
+        html.Div([html.Div(className="legend-icon l-cpp"), "C++ Function"], className="legend-item"),
+        html.Div([html.Div(className="legend-icon l-entry"), "Entry Point (main)"], className="legend-item"),
+        html.Div([html.Div(className="legend-icon l-var"), "Variable"], className="legend-item"),
+        html.Div([html.Div(className="legend-icon l-file"), "File / Module"], className="legend-item"),
+        html.Div([html.Div(className="legend-icon l-cls"), "Class"], className="legend-item"),
+    ], className="mb-4"),
+
+    html.Hr(style={'borderColor': '#444'}),
+
+    html.H6("Controls", className="text-muted"),
+    html.Ul([
+        html.Li("LMB: Select node/edge", className="small text-muted"),
+        html.Li("Scroll: Zoom In/Out", className="small text-muted"),
+        html.Li("Ctrl + Click: Select two nodes to find path", className="small text-muted"),
+        html.Li("Drag Background: Select multiple (Box Selection)", className="small text-muted"),
+    ], className="ps-3"),
+
+    html.H6("Features", className="text-muted mt-3"),
+    html.Div("Analyzes Python (AST) and C++ (Regex) codebases. Shows dependencies, variables, and code complexity.", className="small text-muted")
 ])
 
 app.layout = html.Div([
@@ -508,7 +547,8 @@ app.layout = html.Div([
         html.Button("‹", id="btn-toggle", className="sidebar-toggle-btn"),
         dcc.Tabs([
             dcc.Tab(label='Explorer', children=tab_explorer, className='custom-tab', selected_className='custom-tab--selected'),
-            dcc.Tab(label='Settings', children=tab_settings, className='custom-tab', selected_className='custom-tab--selected')
+            dcc.Tab(label='Settings', children=tab_settings, className='custom-tab', selected_className='custom-tab--selected'),
+            dcc.Tab(label='Help', children=tab_help, className='custom-tab', selected_className='custom-tab--selected')
         ], className='custom-tabs', parent_className='sidebar-content'),
         html.Div(id='resizer', className='resizer')
     ]),
@@ -517,8 +557,8 @@ app.layout = html.Div([
         cyto.Cytoscape(
             id='code-graph',
             boxSelectionEnabled=True,
-            layout={'name': 'cose'},
-            style={'width': '100%', 'height': '100%', 'background': 'transparent'},
+            layout={'name': 'cose', 'animate': True, 'fit': True, 'padding': 20},
+            style={'width': '100%', 'height': '100%', 'background-color': 'transparent'},
             stylesheet=graph_styles,
             elements=[],
             responsive=True
@@ -552,12 +592,14 @@ def load_and_filter(n_clk, n_sub, filters, path):
     if not path: return dash.no_update
     clean_path = path.strip('"').strip("'")
     if not os.path.exists(clean_path): return []
+    manager.py_analyzer = PythonAnalyzer()
     raw_elements = manager.analyze(clean_path, allowed_langs=['python', 'cpp'])
-    filtered = []
-    valid_ids = set()
+
+    filtered, valid_ids = [], set()
+    filters = filters or []
     for el in raw_elements:
         if 'source' not in el['data']:
-            t = el['data']['type']
+            t = el['data'].get('type')
             if t in ['file', 'class', 'entry_point'] or t in filters:
                 valid_ids.add(el['data']['id']); filtered.append(el)
     for el in raw_elements:
@@ -585,14 +627,20 @@ def search(term, elements):
 
 @app.callback(
     Output('code-graph', 'layout'),
-    [Input('setting-repulsion', 'value'), Input('setting-edge-len', 'value'),
-     Input('setting-padding', 'value'), Input('setting-spacing', 'value')]
+    [Input('setting-padding', 'value'), Input('setting-spacing', 'value'),
+     Input('setting-repulsion', 'value'), Input('setting-edge-len', 'value')]
 )
-def update_physics(rep, edge_len, padding, spacing):
+def update_layout_settings(padding, spacing, repulsion, edge_len):
+    rep_map = {1: 100000, 2: 500000, 3: 1000000, 4: 2500000, 5: 5000000}
+    len_map = {1: 20, 2: 40, 3: 60, 4: 100, 5: 150}
+    pad_map = {1: 5, 2: 15, 3: 30, 4: 50, 5: 80}
+    space_map = {1: 20, 2: 50, 3: 100, 4: 180, 5: 300}
     return {
         'name': 'cose', 'animate': True, 'randomize': False,
-        'idealEdgeLength': edge_len, 'nodeRepulsion': rep,
-        'nodeOverlap': 50, 'componentSpacing': spacing, 'gravity': 0.8, 'numIter': 1000, 'fit': True, 'padding': padding
+        'idealEdgeLength': len_map.get(edge_len, 50),
+        'nodeRepulsion': rep_map.get(repulsion, 1000000),
+        'nodeOverlap': 50, 'componentSpacing': space_map.get(spacing, 100),
+        'gravity': 0.8, 'numIter': 1000, 'fit': True, 'padding': pad_map.get(padding, 30)
     }
 
 @app.callback(
@@ -602,7 +650,6 @@ def update_physics(rep, edge_len, padding, spacing):
 )
 def save_image(n): return {'type': 'jpeg', 'action': 'download', 'filename': 'code_graph'}
 
-# --- MAIN INTERACTION: UPDATED HIGHLIGHT LOGIC ---
 @app.callback(
     [Output('code-graph', 'stylesheet'),
      Output('code-display', 'children'),
@@ -621,56 +668,53 @@ def save_image(n): return {'type': 'jpeg', 'action': 'download', 'filename': 'co
      State('history-store', 'data'),
      State('history-index', 'data')]
 )
-def main_interaction(sel_nodes, tap_edge, tap_node, search_clk, btn_back, btn_fwd, node_op,
+def main_interaction(sel_nodes, tap_edge, tap_node, search_clk, btn_back, btn_fwd, node_op_lvl,
                      styles, elements, history, hist_idx):
     ctx = callback_context
     if not ctx.triggered: return styles, "", "Select...", history, hist_idx
 
     prop_id = ctx.triggered[0]['prop_id']
-    target_ids = []
-    target_edge = None
-    mode = 'RESET'
+    target_ids, target_edge, mode = [], None, 'RESET'
 
-    if 'btn-back' in prop_id and hist_idx > 0:
+    if 'tapNodeData' in prop_id and tap_node is None: mode = 'RESET'
+    elif 'btn-back' in prop_id and hist_idx > 0:
         hist_idx -= 1; target_ids = [history[hist_idx]]; mode = 'NODE'
     elif 'btn-fwd' in prop_id and hist_idx < len(history) - 1:
         hist_idx += 1; target_ids = [history[hist_idx]]; mode = 'NODE'
     elif 'search-item' in prop_id:
         tid = ctx.triggered_id['index']; target_ids = [tid]; mode = 'NODE'
         if not history or history[hist_idx] != tid: history = history[:hist_idx+1] + [tid]; hist_idx += 1
-
-    elif 'tapNodeData' in prop_id and tap_node is None:
-        mode = 'RESET'
-
-    elif 'tapEdgeData' in prop_id:
-        if tap_edge: target_edge = tap_edge; mode = 'EDGE'
-
+    elif 'tapEdgeData' in prop_id and tap_edge:
+        target_edge = tap_edge; mode = 'EDGE'
     elif 'selectedNodeData' in prop_id:
         if sel_nodes:
             target_ids = [n['id'] for n in sel_nodes]; mode = 'NODE'
             last_id = target_ids[-1]
             if not history or history[hist_idx] != last_id: history = history[:hist_idx+1] + [last_id]; hist_idx += 1
         else: mode = 'RESET'
+    elif 'setting-' in prop_id:
+        if sel_nodes: target_ids = [n['id'] for n in sel_nodes]; mode = 'NODE'
+        elif tap_edge: target_edge = tap_edge; mode = 'EDGE'
+
+    op_map = {1: 0.05, 2: 0.1, 3: 0.2, 4: 0.4, 5: 0.8}
+    final_op = op_map.get(node_op_lvl, 0.1)
 
     if mode == 'RESET':
         return graph_styles, "", "Select node/edge...", history, hist_idx
 
-    info = []
-    code = ""
-    highlight_ids = set(target_ids)
-    path_edges = set()
+    info, code, highlight_ids, path_edges = [], "", set(target_ids), set()
 
     if len(target_ids) == 2:
         start, end = target_ids[0], target_ids[1]
         adj = collections.defaultdict(list)
         for el in elements:
             if 'source' in el['data']: adj[el['data']['source']].append(el['data']['target'])
-        queue = [[start]]; visited = {start}; found_path = None
+        queue, visited, found_path = [[start]], {start}, None
         while queue:
             path = queue.pop(0)
             if path[-1] == end: found_path = path; break
-            for neighbor in adj[path[-1]]:
-                if neighbor not in visited: visited.add(neighbor); queue.append(list(path) + [neighbor])
+            for n in adj[path[-1]]:
+                if n not in visited: visited.add(n); queue.append(list(path) + [n])
         if found_path:
             info.append(html.Div(f"Path: {len(found_path)} steps", className="text-success"))
             highlight_ids.update(found_path)
@@ -690,8 +734,7 @@ def main_interaction(sel_nodes, tap_edge, tap_node, search_clk, btn_back, btn_fw
             info.append(html.H4(main_node.get('name', 'Unknown'), className="text-info"))
             info.append(html.Div([
                 dbc.Badge(f"LOC: {main_node.get('loc',0)}", color="dark", className="me-1"),
-                dbc.Badge(f"Complexity: {main_node.get('complexity',0)}",
-                          color="danger" if main_node.get('complexity',0) > 10 else "success", className="me-1")
+                dbc.Badge(f"Complexity: {main_node.get('complexity',0)}", color="danger" if main_node.get('complexity',0) > 10 else "success", className="me-1")
             ]))
             for el in elements:
                 if 'source' in el['data']:
@@ -699,47 +742,26 @@ def main_interaction(sel_nodes, tap_edge, tap_node, search_clk, btn_back, btn_fw
                     if s in target_ids: highlight_ids.add(t)
                     if t in target_ids: highlight_ids.add(s)
 
-    # === ОБНОВЛЕННАЯ ЛОГИКА СТИЛЕЙ ===
     new_style = list(graph_styles)
-
-    # 1. Приглушаем ВСЕ дочерние ноды (но не родителей!)
-    # Используем node:childless, чтобы не трогать контейнеры файлов
-    new_style.append({'selector': 'node:childless', 'style': {'opacity': node_op}})
-
-    # 2. Приглушаем стрелки
+    new_style.append({'selector': 'node:childless', 'style': {'opacity': final_op}})
     new_style.append({'selector': 'edge', 'style': {'opacity': 0.1}})
+    new_style.append({'selector': ':parent', 'style': {'border-opacity': final_op}})
 
-    # 3. Родители (коробочки) остаются прозрачными по фону, но приглушаем границы
-    new_style.append({'selector': ':parent', 'style': {'border-opacity': node_op, 'color': '#555'}})
-
-    # 4. Яркая подсветка активных элементов
     if highlight_ids:
-        # Выделяем ноды (возвращаем opacity 1)
         sel = ", ".join([f'node[id = "{x}"]' for x in highlight_ids])
-        if sel:
-            new_style.append({'selector': sel, 'style': {'opacity': 1, 'border-color': '#fff', 'border-width': 2}})
-            # Также подсвечиваем родительские коробки, если внутри них что-то выбрано?
-            # Пока оставим их приглушенными, чтобы фокус был на функциях.
+        if sel: new_style.append({'selector': sel, 'style': {'opacity': 1, 'border-color': '#fff', 'border-width': 2}})
 
-    # 5. Спец-выделение главной ноды
     for tid in target_ids:
         new_style.append({'selector': f'node[id = "{tid}"]', 'style': {'border-width': 4, 'border-color': '#F1C40F', 'opacity': 1}})
 
-    # 6. Подсветка связей
     for el in elements:
         if 'source' in el['data']:
             s, t = el['data']['source'], el['data']['target']
             eid = f"{s}->{t}"
-
-            # Если это путь
             if eid in path_edges:
-                new_style.append({'selector': f'edge[source="{s}"][target="{t}"]', 'style': {'opacity': 1, 'width': 6, 'line-color': '#FFD700', 'target-arrow-color': '#FFD700', 'z-index': 999}})
-
-            # Если кликнули по ребру
+                new_style.append({'selector': f'edge[source="{s}"][target="{t}"]', 'style': {'opacity': 1, 'width': 6, 'line-color': '#FFD700', 'z-index': 999}})
             elif mode == 'EDGE' and target_edge and s == target_edge['source'] and t == target_edge['target']:
                 new_style.append({'selector': f'edge[source="{s}"][target="{t}"]', 'style': {'opacity': 1, 'width': 4, 'line-color': '#E74C3C'}})
-
-            # Если это соседи выделенной ноды
             elif s in highlight_ids and t in highlight_ids:
                 new_style.append({'selector': f'edge[source="{s}"][target="{t}"]', 'style': {'opacity': 1}})
 
